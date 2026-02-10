@@ -10,28 +10,36 @@ import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_V2_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from PIL import Image
 from tqdm import tqdm  # Progress bar library
 
 # --------------------------------- 全局配置 ---------------------------------
-DATA_ROOT = "/home/fxf/data/nuScenes-mini"  # 改为你的数据集实际路径
+DATA_ROOT = "/home/fxf/data/nuScenes-mini"  # 改为数据集实际路径
 JSON_PATH = os.path.join(DATA_ROOT, "v1.0-mini/image_annotations.json")
 IMG_FORMAT = ".jpg"
 SEED = 42
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 TEST_RATIO = 0.1
-BATCH_SIZE = 4
-NUM_WORKERS = 0
-EPOCHS = 10
-LR = 0.005
+BATCH_SIZE = 8 if torch.cuda.is_available() else 4
+NUM_WORKERS = 2 if torch.cuda.is_available() else 0
+EPOCHS = 500
+LR = 0.001
 MOMENTUM = 0.9
-WEIGHT_DECAY = 0.0005
+WEIGHT_DECAY = 0.0001
 RESIZE_SIZE = (640, 480)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+
+# 新增：筛选配置（可直接修改）
+TARGET_CATEGORIES = {"vehicle.car", "vehicle.bicycle", "vehicle.truck", "vehicle.construction", "vehicle.motorcycle", "vehicle.bus.rigid", "vehicle.bus.bendy", "vehicle.trailer", "movable_object.pushable_pullable", "human.pedestrian.child", "human.pedestrian.construction_worker", "human.pedestrian.personal_mobility", "human.pedestrian.police_officer", "human.pedestrian.adult"}  # 保留的目标类别
+# TARGET_CATEGORIES = {"vehicle.car", "vehicle.bicycle", "vehicle.truck", "vehicle.construction", "vehicle.motorcycle", "vehicle.bus.rigid", "vehicle.bus.bendy", "vehicle.trailer", "movable_object.pushable_pullable", "movable_object.trafficcone", "movable_object.barrier" , "human.pedestrian.child", "human.pedestrian.construction_worker", "human.pedestrian.personal_mobility", "human.pedestrian.police_officer", "human.pedestrian.adult", "static_object.bicycle_rack"}  # 保留的目标类别
+
+FILTER_VISIBILITY = {1, 2}  # 需要删除的低可见度token
+print(f"Using device: {DEVICE}")
+print(f"筛选规则：保留类别{TARGET_CATEGORIES} | 过滤可见度{FILTER_VISIBILITY}")
 
 # 固定随机种子（保证实验可复现）
 random.seed(SEED)
@@ -39,6 +47,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True  # 优化点7：开启cuDNN基准，加速训练
 
 # --------------------------------- 标注格式转换（框→图） --------------------------
 def convert_box_anno_to_image_anno(box_anno_list: List[Dict]) -> List[Dict]:
@@ -47,12 +56,28 @@ def convert_box_anno_to_image_anno(box_anno_list: List[Dict]) -> List[Dict]:
     转换后每个字典包含：filename + 该图所有bbox_corners + 该图所有category_names
     """
     image_anno_dict = {}
+    total_box = 0
+    reserve_box = 0
+    filter_box = 0
     for single_box_anno in box_anno_list:
+        total_box += 1
         # 提取单框标注信息
         img_filename = single_box_anno.get("filename", "unknown")
         bbox = single_box_anno.get("bbox_corners", [0, 0, 0, 0])
         category = single_box_anno.get("category_name", "unknown")
+        visibility = single_box_anno.get("visibility_token", "unknown")
         
+         # 核心筛选逻辑：1.类别在目标列表  2.可见度不在过滤列表  （同时满足）
+        # 处理visibility为字符串/数字的情况，统一转int判断
+        try:
+            vis_int = int(visibility)
+        except (ValueError, TypeError):
+            vis_int = -1  # 非数字可见度直接过滤
+        if category not in TARGET_CATEGORIES or vis_int in FILTER_VISIBILITY:
+            filter_box += 1
+            continue  # 过滤掉不满足条件的框
+        reserve_box += 1
+
         # 按图片文件名分组，整合同图的所有框和类别
         if img_filename not in image_anno_dict:
             image_anno_dict[img_filename] = {
@@ -62,9 +87,13 @@ def convert_box_anno_to_image_anno(box_anno_list: List[Dict]) -> List[Dict]:
             }
         image_anno_dict[img_filename]["bbox_corners"].append(bbox)
         image_anno_dict[img_filename]["category_names"].append(category)
+    #过滤后：删除无标注框的图片
+    image_anno_dict = {k: v for k, v in image_anno_dict.items() if len(v["bbox_corners"]) > 0}
+       
     
     # 字典转列表，最终返回「一张图一个字典」的列表
     image_anno_list = list(image_anno_dict.values())
+    print(f'标注筛选统计：总框数={total_box} | 保留框数={reserve_box} | 过滤框数={filter_box}')
     print(f"标注格式转换完成：{len(box_anno_list)}个框标注 → {len(image_anno_list)}张图片标注")
     return image_anno_list
 
@@ -140,7 +169,7 @@ def visualize_prediction(model: torch.nn.Module, img_path: str, gt_bboxes: List[
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(img, f"GT:{gt_cat}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     # 绘制高置信度预测框（置信度>0.5，过滤低置信无效框）
-    conf_thresh = 0.5
+    conf_thresh = 0.3
     valid_idx = pred["scores"] > conf_thresh
     pred_boxes = pred["boxes"][valid_idx]
     pred_labels = pred["labels"][valid_idx]
@@ -328,11 +357,25 @@ def validate(model: torch.nn.Module, loader: DataLoader, epoch: int) -> float:
 # -------------------------------------------- 主训练流程 -----------------------------------
 def main_train_pipeline(model: torch.nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: optim.Optimizer) -> Dict[str, List[float]]:
     loss_record = {"train_loss": [], "val_loss": []}
+    best_val_loss = float('inf')
+    patience = 5  # 连续2轮验证loss上升就停止
+    patience_counter = 0
+
     for epoch in range(EPOCHS):
         train_loss = train_one_epoch(model, train_loader, optimizer, epoch)
         val_loss = validate(model, val_loader, epoch)
         loss_record["train_loss"].append(train_loss)
         loss_record["val_loss"].append(val_loss)
+        # 早停逻辑：验证损失不下降则计数，连续patience轮后停止训练
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), f"fasterrcnn_best.pth")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"验证损失连续{patience}轮未下降，提前停止训练")
+                break
     # 训练完成统计
     print("=== 训练完成 ===")
     print(f"最终训练损失: {loss_record['train_loss'][-1]:.4f}")
