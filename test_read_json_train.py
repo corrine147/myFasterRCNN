@@ -16,14 +16,16 @@ from PIL import Image
 from tqdm import tqdm  # Progress bar library
 
 # --------------------------------- 全局配置 ---------------------------------
-DATA_ROOT = "/home/fxf/data/nuScenes-mini"  # 改为数据集实际路径
-JSON_PATH = os.path.join(DATA_ROOT, "v1.0-mini/image_annotations.json")
+# DATA_ROOT = "/home/fxf/data/nuScenes-mini"  # 改为数据集实际路径
+# JSON_PATH = os.path.join(DATA_ROOT, "v1.0-mini/image_annotations.json")
+DATA_ROOT = "/home/fxf/data/nuScenes-full"  # 改为数据集实际路径
+JSON_PATH = os.path.join(DATA_ROOT, "image_annotations.json")
 IMG_FORMAT = ".jpg"
 SEED = 42
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 TEST_RATIO = 0.1
-BATCH_SIZE = 8 if torch.cuda.is_available() else 4
+BATCH_SIZE = 2 if torch.cuda.is_available() else 4
 NUM_WORKERS = 2 if torch.cuda.is_available() else 0
 EPOCHS = 500
 LR = 0.001
@@ -32,6 +34,11 @@ WEIGHT_DECAY = 0.0001
 RESIZE_SIZE = (640, 480)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+
+LOAD_PRETRAINED_WEIGHTS = True  # 控制是否加载已训练的pth文件
+PRETRAINED_WEIGHTS_PATH = "fasterrcnn_best_1.pth"  # 已训练权重文件路径
+SAVE_EPOCH_WEIGHTS = True  # 控制是否每个epoch保存权重
+EPOCH_WEIGHTS_DIR = "epoch_weights"  # 存储每个epoch权重的文件夹
 
 # 新增：筛选配置（可直接修改）
 TARGET_CATEGORIES = {"vehicle.car", "vehicle.bicycle", "vehicle.truck", "vehicle.construction", "vehicle.motorcycle", "vehicle.bus.rigid", "vehicle.bus.bendy", "vehicle.trailer", "movable_object.pushable_pullable", "human.pedestrian.child", "human.pedestrian.construction_worker", "human.pedestrian.personal_mobility", "human.pedestrian.police_officer", "human.pedestrian.adult"}  # 保留的目标类别
@@ -48,6 +55,9 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True  # 优化点7：开启cuDNN基准，加速训练
+
+if SAVE_EPOCH_WEIGHTS and not os.path.exists(EPOCH_WEIGHTS_DIR):
+    os.makedirs(EPOCH_WEIGHTS_DIR)
 
 # --------------------------------- 标注格式转换（框→图） --------------------------
 def convert_box_anno_to_image_anno(box_anno_list: List[Dict]) -> List[Dict]:
@@ -309,7 +319,16 @@ def build_fasterrcnn_model(num_classes: int) -> torch.nn.Module:
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     model = model.to(DEVICE)
-    return model
+    #加载权重
+    if LOAD_PRETRAINED_WEIGHTS and os.path.exists(PRETRAINED_WEIGHTS_PATH):
+        try:
+            model.load_state_dict(torch.load(PRETRAINED_WEIGHTS_PATH, map_location=DEVICE))
+            print(f"成功加载预训练权重: {PRETRAINED_WEIGHTS_PATH}")
+        except Exception as e:
+            print(f"加载预训练权重失败: {e}")
+    else:
+        print(f"未找到预训练权重文件: {PRETRAINED_WEIGHTS_PATH}，将从头开始训练")
+    return model        
 
 # -------------------------------------------- 训练/验证函数 ---------------------------------
 def train_one_epoch(model: torch.nn.Module, loader: DataLoader, optimizer: optim.Optimizer, epoch: int) -> float:
@@ -332,6 +351,13 @@ def train_one_epoch(model: torch.nn.Module, loader: DataLoader, optimizer: optim
     avg_loss = total_loss / len(loader)
     pbar.close()
     print(f"训练轮次[{epoch+1}/{EPOCHS}] 平均损失: {avg_loss:.4f}")
+
+    # 每个epoch保存权重（如果配置开启）
+    if SAVE_EPOCH_WEIGHTS:
+        epoch_weight_path = os.path.join(EPOCH_WEIGHTS_DIR, f"fasterrcnn_epoch_{epoch+1}.pth")
+        torch.save(model.state_dict(), epoch_weight_path)
+        print(f"第{epoch+1}轮权重已保存至: {epoch_weight_path}")
+
     return avg_loss
 
 @torch.no_grad()
@@ -358,7 +384,7 @@ def validate(model: torch.nn.Module, loader: DataLoader, epoch: int) -> float:
 def main_train_pipeline(model: torch.nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: optim.Optimizer) -> Dict[str, List[float]]:
     loss_record = {"train_loss": [], "val_loss": []}
     best_val_loss = float('inf')
-    patience = 5  # 连续2轮验证loss上升就停止
+    patience = 5  # 连续n轮验证loss上升就停止
     patience_counter = 0
 
     for epoch in range(EPOCHS):
